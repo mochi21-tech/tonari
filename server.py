@@ -39,7 +39,7 @@ BRIDGE_DIR.mkdir(exist_ok=True)
 # 挙動が変わる修正を入れたら必ず日付を更新すること。
 # （過去に「ファイルは直っているが起動中のプロセスが古い」事故があり、
 #   pydanticが未知フィールドを黙って捨てるため気付けなかった）
-SERVER_VERSION = "2026-07-16"
+SERVER_VERSION = "2026-07-25"
 
 HOST = os.environ.get("COMPANION_HOST", "127.0.0.1")
 PORT = int(os.environ.get("COMPANION_PORT", "8000"))
@@ -549,6 +549,9 @@ class CliRequest(BaseModel):
     effort: str | None = None
     request_id: str | None = None
     health_data: str | None = None
+    # クライアント能力フラグ: trueなら result/result_parts を「未配達分のみ」で受け取れる
+    # （undelivered_only対応。旧アプリはこのフィールドを送らないため従来形式=全文で返す）
+    supports_undelivered_only: bool = False
 
 
 # クライアント入力のうち claude の argv やファイル名に入るものは形式を固定する。
@@ -586,6 +589,15 @@ class _CliJob:
         self._included_context = False
         self._included_session_letter = False
         self.result_delivered = False
+        self.request_id: str | None = None
+        # このジョブを投げたクライアントがundelivered_only形式に対応しているか
+        self.supports_undelivered_only = False
+
+    def undelivered_texts(self) -> list[str]:
+        """intermediate_messagesとして配達済みの分を除いた、未配達のassistantテキスト。
+        result/recoveredで全文を返すと配達済み分が二重表示になる（2026-07-22発覚）ため、
+        アプリへの最終応答はこれを基準にする。"""
+        return self._assistant_texts[self._last_intermediate_text_idx + 1:]
 
     def add_event(self, event: dict) -> None:
         event["index"] = self._event_index
@@ -689,6 +701,26 @@ class _PersistentSession:
         # /sync がアプリ発のプロンプト（HB・センサー付きメッセージ等）を
         # 「PC側で打った言葉」と誤ってアプリに返さないための送信済みリスト
         self._sent_user_texts: list[str] = []
+        # 再送の冪等化用: client request_id -> job_id（挿入順、直近50件のみ保持）
+        self._request_job_ids: dict[str, str] = {}
+        # リアルタイム経路（intermediate/result/recovered）がアプリへ配達する(した)
+        # assistantテキストの台帳。/sync が同じ内容を重ねて返して二重表示になるのを防ぐ
+        # （2026-07-22発覚）。dictで挿入順を保持し、古い分から間引く
+        self._realtime_texts: dict[str, None] = {}
+
+    def remember_realtime_text(self, text: str) -> None:
+        self._realtime_texts[text] = None
+        if len(self._realtime_texts) > 600:
+            for k in list(self._realtime_texts)[:100]:
+                del self._realtime_texts[k]
+
+    def remember_request(self, request_id: str | None, job_id: str) -> None:
+        if not request_id:
+            return
+        self._request_job_ids[request_id] = job_id
+        if len(self._request_job_ids) > 50:
+            for k in list(self._request_job_ids)[:-50]:
+                del self._request_job_ids[k]
 
     @property
     def _letter_sent_marker(self) -> Path:
@@ -870,8 +902,12 @@ class _PersistentSession:
                         if isinstance(block, dict):
                             if block.get("type") == "text":
                                 t = block.get("text", "")
-                                if t and "previous response had no visible output" not in t:
+                                # "No response requested." はClaude Code本体が書く合成メタ応答
+                                # （ScheduleWakeup待機中の割り込み等で発生）。会話として配らない
+                                if t and "previous response had no visible output" not in t \
+                                        and t.strip() != "No response requested.":
                                     job._assistant_texts.append(t)
+                                    self.remember_realtime_text(t)
                             elif block.get("type") == "thinking":
                                 t = block.get("thinking", "")
                                 if t:
@@ -983,13 +1019,39 @@ async def cli_start(req: CliRequest):
         _persistent_sessions[req.session_id] = _PersistentSession(req.session_id)
     session = _persistent_sessions[req.session_id]
 
+    # 再送の冪等化: 同じrequest_idのジョブが既にあれば、新規実行せず既存ジョブに合流させる。
+    # POSTの応答だけがアプリに届かなかった場合（アプリは「!」表示だがサーバーは処理済み）、
+    # 再送で同じメッセージが二重にClaudeへ届くのを防ぐ（2026-07-22発覚）
+    if req.request_id:
+        dup_job_id = session._request_job_ids.get(req.request_id)
+        dup_job = _cli_jobs.get(dup_job_id) if dup_job_id else None
+        if dup_job is not None and not dup_job.error:
+            print(f"CLI DUP [{dup_job.job_id}]: resend of request_id={req.request_id[:8]} rejoined (done={dup_job.done})", flush=True)
+            return {"job_id": dup_job.job_id, "session_id": req.session_id, "duplicate": True}
+
     prev = session._last_completed_job
     if prev is not None and not prev.result_delivered and prev.result_text is not None and not prev.error:
         print(f"CLI RECOVER [{prev.job_id}]: returning undelivered result for session {req.session_id[:8]}", flush=True)
         prev.result_delivered = True
-        recovered_resp: dict = {"job_id": prev.job_id, "session_id": req.session_id, "recovered": True, "result": prev.result_text}
-        if len(prev._assistant_texts) > 1:
-            recovered_resp["result_parts"] = prev._assistant_texts
+        recovered_resp: dict = {"job_id": prev.job_id, "session_id": req.session_id, "recovered": True}
+        if req.supports_undelivered_only:
+            # 未flushのintermediateも回収対象（一度もポーリングされなかったジョブの先行テキスト）
+            pending = prev._pending_intermediates
+            prev._pending_intermediates = []
+            parts = pending + prev.undelivered_texts()
+            recovered_resp["undelivered_only"] = True
+            if parts:
+                recovered_resp["result"] = "\n\n".join(parts)
+            else:
+                # テキストなしターン（raw fallback）はそのまま、全文配達済みなら空
+                recovered_resp["result"] = prev.result_text if not prev._assistant_texts else ""
+            if len(parts) > 1:
+                recovered_resp["result_parts"] = parts
+        else:
+            # 旧アプリ互換: 従来どおり全文を返す
+            recovered_resp["result"] = prev.result_text
+            if len(prev._assistant_texts) > 1:
+                recovered_resp["result_parts"] = prev._assistant_texts
         if prev._thinking_texts:
             recovered_resp["thinking"] = prev._thinking_texts
         return recovered_resp
@@ -1003,9 +1065,16 @@ async def cli_start(req: CliRequest):
             job._included_context = True
         if include_session_letter and req.session_letter:
             job._included_session_letter = True
+        job.request_id = req.request_id
+        job.supports_undelivered_only = req.supports_undelivered_only
         _cli_jobs[job_id] = job
+        session.remember_request(req.request_id, job_id)
         await session.send_message(message, job)
     except Exception as e:
+        # 開始できなかったジョブをerror/doneにしておく。放置するとrequest_id台帳経由の
+        # DUP合流先になり、再送が「永遠に完了しないジョブ」をポーリングし続ける
+        job.error = str(e)
+        job.done = True
         job.cleanup_temp()
         raise HTTPException(status_code=500, detail=f"メッセージの送信に失敗しました: {e}")
 
@@ -1028,10 +1097,23 @@ async def cli_stream(job_id: str, after: int = -1):
         job._pending_intermediates = []
     if job.done:
         response["session_id"] = job.session_id
-        if job.result_text is not None:
-            response["result"] = job.result_text
-        if len(job._assistant_texts) > 1:
-            response["result_parts"] = job._assistant_texts
+        if job.supports_undelivered_only:
+            # result/result_partsを「未配達分のみ」で返す（intermediate配達済み分の二重表示防止）。
+            # アプリはこのフラグを見て旧来の「最後のpartだけ保存」補正をスキップする
+            response["undelivered_only"] = True
+            undelivered = job.undelivered_texts()
+            if job._assistant_texts:
+                response["result"] = "\n\n".join(undelivered)
+            elif job.result_text is not None:
+                response["result"] = job.result_text
+            if len(undelivered) > 1:
+                response["result_parts"] = undelivered
+        else:
+            # 旧アプリ互換: 従来どおり全文を返す
+            if job.result_text is not None:
+                response["result"] = job.result_text
+            if len(job._assistant_texts) > 1:
+                response["result_parts"] = job._assistant_texts
         if job._thinking_texts:
             response["thinking"] = job._thinking_texts
         if job.error:
@@ -1132,6 +1214,9 @@ async def sync_session(session_id: str, after: str = ""):
     if jsonl_path is None:
         return {"messages": [], "error": "Session not found"}
 
+    # Claude Code本体が内部処理で書き込む合成メタメッセージ。会話ではないので同期しない
+    # （2026-07-22発覚: ScheduleWakeup待機中の割り込みで生成され、幽霊バブルとして表示された）
+    harness_meta_texts = {"Continue from where you left off.", "No response requested."}
     messages = []
     pending_thinking = ""
     try:
@@ -1147,6 +1232,8 @@ async def sync_session(session_id: str, after: str = ""):
                 entry_type = entry.get("type", "")
                 if entry_type not in ("user", "assistant"):
                     continue
+                if entry.get("isMeta"):
+                    continue
                 ts = entry.get("timestamp", "")
                 if after and ts <= after:
                     continue
@@ -1154,11 +1241,21 @@ async def sync_session(session_id: str, after: str = ""):
                 text = extractor(entry.get("message", ""))
                 if not text:
                     continue
+                if text.strip() in harness_meta_texts:
+                    continue
                 if text.lstrip().startswith("<task-notification"):
                     continue
                 if entry_type == "user" and _is_app_origin_user_text(session_id, text):
                     pending_thinking = ""
                     continue
+                if entry_type == "assistant" and active is not None:
+                    # リアルタイム経路（intermediate/result/recovered）が配達する(した)応答は
+                    # /sync からは返さない（二重表示防止 2026-07-22発覚）。thinkingを除いた
+                    # 本文で照合する（台帳はtextブロック単位のため）
+                    plain = _extract_text(entry.get("message", ""))
+                    if plain and plain in active._realtime_texts:
+                        pending_thinking = ""
+                        continue
                 if entry_type == "assistant":
                     stripped = text.strip()
                     if stripped.startswith("<thinking>") and stripped.endswith("</thinking>"):
