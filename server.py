@@ -29,7 +29,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 BRIDGE_DIR = Path(__file__).parent / "bridge"
@@ -39,7 +39,7 @@ BRIDGE_DIR.mkdir(exist_ok=True)
 # 挙動が変わる修正を入れたら必ず日付を更新すること。
 # （過去に「ファイルは直っているが起動中のプロセスが古い」事故があり、
 #   pydanticが未知フィールドを黙って捨てるため気付けなかった）
-SERVER_VERSION = "2026-07-25"
+SERVER_VERSION = "2026-08-30"
 
 HOST = os.environ.get("COMPANION_HOST", "127.0.0.1")
 PORT = int(os.environ.get("COMPANION_PORT", "8000"))
@@ -484,6 +484,32 @@ async def pending():
 _ENV_CLAUDE_CMD = os.environ.get("COMPANION_CLAUDE_CMD", "").strip().strip('"').strip()
 CLAUDE_CMD = _ENV_CLAUDE_CMD or "claude"
 CLI_JOB_TTL = 600  # ジョブ情報の保持時間（秒）
+TOOL_TIMEOUT_MIN = 60     # アプリの「ツール実行の最長時間（秒）」の下限（0=既定はそのまま）
+TOOL_TIMEOUT_MAX = 3600   # 同上限
+
+
+def _normalize_tool_timeout(sec) -> int:
+    """0 以下・不正値は 0（Claude Code の既定）。それ以外は 60〜3600 に丸める。"""
+    try:
+        sec = int(sec or 0)
+    except (TypeError, ValueError):
+        return 0
+    if sec <= 0:
+        return 0
+    return max(TOOL_TIMEOUT_MIN, min(TOOL_TIMEOUT_MAX, sec))
+
+
+def _claude_env(tool_timeout_sec: int, base: dict | None = None) -> dict:
+    """claude 起動用の環境変数。tool_timeout_sec>0 なら Bash ツールの既定・最大タイムアウトを揃えて指定する
+    （Claude Code の BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS）。0 なら元の環境のまま（既定 2 分・AI が伸ばして最大 10 分）。"""
+    env = dict(os.environ if base is None else base)
+    sec = _normalize_tool_timeout(tool_timeout_sec)
+    if sec > 0:
+        ms = str(sec * 1000)
+        env["BASH_DEFAULT_TIMEOUT_MS"] = ms
+        env["BASH_MAX_TIMEOUT_MS"] = ms
+    return env
+CLI_AGENT_WAIT_MAX = 300  # 係（サブエージェント）の結果を待ってジョブを開けておく上限（秒・2026-08-23。待つ間は次のメッセージを送れないので、事故時に待たせる長さ。越えた分は受信箱/syncで届く）
 
 
 def _resolve_claude_cmd() -> str | None:
@@ -552,6 +578,25 @@ class CliRequest(BaseModel):
     # クライアント能力フラグ: trueなら result/result_parts を「未配達分のみ」で受け取れる
     # （undelivered_only対応。旧アプリはこのフィールドを送らないため従来形式=全文で返す）
     supports_undelivered_only: bool = False
+    # trueなら claude を --permission-prompt-tool 付きで起動し、承認が要るツール実行を
+    # アプリ（スマホ）に問い合わせる。falseなら従来どおり（承認が要るものは自動deny）
+    permission_prompt: bool = False
+    # ツール実行（Bash等）1回の最長時間（秒）。0=Claude Codeの既定（2分・AIが伸ばして最大10分）。
+    # claude 起動時の環境変数 BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS になる。値が変わればプロセス再起動（2026-08-28）
+    tool_timeout_sec: int = 0
+    # trueなら message はClaude Codeのスラッシュコマンド（/compact 等）。時刻・センサー・添付・
+    # 大切なこと・手紙を一切付けず、そのまま常駐プロセスへ流す（2026-08-17 ロードマップ④-b）。
+    # 旧アプリはこのフィールドを送らないが、message が「/英数字」で始まればサーバー側でも同じ扱いにする
+    slash_command: bool = False
+
+
+# アプリからの「/compact」「/context」等をスラッシュコマンドとみなす形。
+# 「/」の直後に英数字・_・:・- が続き、そこで終わるか空白が来るもの（「/って何？」は該当しない）
+_SLASH_RE = re.compile(r"^/[A-Za-z0-9_:-]+(?:\s|$)")
+
+
+def _is_slash_command(req: "CliRequest") -> bool:
+    return bool(req.slash_command) or bool(_SLASH_RE.match(req.message.strip()))
 
 
 # クライアント入力のうち claude の argv やファイル名に入るものは形式を固定する。
@@ -567,6 +612,14 @@ CLI_TEMP_DIR.mkdir(exist_ok=True)
 HEALTH_DATA_PATH = BRIDGE_DIR / "health_data.json"
 _SESSION_LETTER_SENT_DIR = BRIDGE_DIR / "letter_sent"
 _SESSION_LETTER_SENT_DIR.mkdir(exist_ok=True)
+# show_image / request_permission の受け渡し場所（mcp_tools.py と共有。名前を変えるなら両方）
+IMAGES_DIR = BRIDGE_DIR / "images"
+IMAGES_DIR.mkdir(exist_ok=True)
+PERMISSIONS_DIR = BRIDGE_DIR / "permissions"
+PERMISSIONS_DIR.mkdir(exist_ok=True)
+PERMISSION_TOOL_NAME = "mcp__companion__request_permission"
+_IMAGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_PERM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 class _CliJob:
@@ -586,6 +639,16 @@ class _CliJob:
         self._thinking_texts: list[str] = []
         self._pending_intermediates: list[str] = []
         self._last_intermediate_text_idx: int = -1
+        # サブエージェント（Agentツールで起こした係）由来のイベントを捨てた数（2026-08-23・/health等の診断用）
+        self._subagent_events_dropped: int = 0
+        # このターンで起こした係の数。result 時に >0 なら「返事はまだ終わっていない」としてジョブを開けたまま
+        # 係の結果を待ち、本人が続きを書いて次の result が来た時に閉じる（2026-08-23）
+        self._agents_launched_this_turn: int = 0
+        self._waiting_for_agents_since: float | None = None
+        # このターンで本人が呼んだ Agent ツールの tool_use_id。「係を起こした印」はこの id の tool_result だけで探す
+        # （2026-08-28: Read/Grep でサーバーのコード自体を読むと、本文に印の文字列が混ざって誤検知し、
+        # ジョブが「係待ち」で開いたまま→アプリのぐるぐるが残り・次の送信が busy になった）
+        self._agent_tool_use_ids: set[str] = set()
         self._included_context = False
         self._included_session_letter = False
         self.result_delivered = False
@@ -612,6 +675,125 @@ class _CliJob:
 _cli_jobs: dict[str, _CliJob] = {}
 
 
+def _is_subagent_event(event: dict) -> bool:
+    """stream-json のイベントがサブエージェント（Agentツールで起こした係）由来か。
+    本人の assistant/user イベントは parent_tool_use_id が None。係のイベントは親の tool_use_id が入る。
+    system/result 等は対象外（False）。"""
+    if not isinstance(event, dict):
+        return False
+    if event.get("type") not in ("assistant", "user"):
+        return False
+    return bool(event.get("parent_tool_use_id"))
+
+
+_AGENT_LAUNCHED_MARK = "Async agent launched successfully"
+
+
+def _event_launches_async_agent(event: dict, agent_tool_use_ids: set[str] | None = None) -> bool:
+    """user イベント（tool_result）が Agent ツールの「Async agent launched successfully」を含むか。
+    stream-json の tool_result は content が文字列のことも {type:text} の配列のこともあるので文字列化して探す。
+    `agent_tool_use_ids` を渡した時は、その id（本人が呼んだ Agent ツール）の tool_result だけを見る。
+    渡さないと event 全体の部分一致（旧挙動）——Read/Grep の結果にこの文字列が載っただけで誤検知する
+    （2026-08-28: サーバーのコードを読んだターンで再現）ので、本線では必ず id を渡す。"""
+    if not isinstance(event, dict) or event.get("type") != "user":
+        return False
+    if agent_tool_use_ids is None:
+        try:
+            return _AGENT_LAUNCHED_MARK in json.dumps(event, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return False
+    if not agent_tool_use_ids:
+        return False
+    msg = event.get("message", {})
+    content = msg.get("content", []) if isinstance(msg, dict) else []
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        if block.get("tool_use_id") not in agent_tool_use_ids:
+            continue
+        try:
+            if _AGENT_LAUNCHED_MARK in json.dumps(block.get("content", ""), ensure_ascii=False):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _split_assistant_event(event: dict) -> tuple[list[str], list[str]]:
+    """assistant イベントから本文テキストと thinking を取り出す（合成メタ応答は除く）。"""
+    texts: list[str] = []
+    thinks: list[str] = []
+    msg = event.get("message", {}) if isinstance(event, dict) else {}
+    content = msg.get("content", []) if isinstance(msg, dict) else []
+    if not isinstance(content, list):
+        return texts, thinks
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            t = block.get("text", "")
+            if t and "previous response had no visible output" not in t and t.strip() != "No response requested.":
+                texts.append(t)
+        elif block.get("type") == "thinking":
+            t = block.get("thinking", "")
+            if t:
+                thinks.append(t)
+    return texts, thinks
+
+
+def _is_sidechain_entry(entry: dict) -> bool:
+    """会話ログ JSONL のエントリがサブエージェント側（isSidechain）か。"""
+    return bool(isinstance(entry, dict) and entry.get("isSidechain"))
+
+
+def _live_uuids(entries: list) -> set:
+    """会話ログ JSONL のうち「今生きている鎖」に載る行の uuid を返す（2026-08-23）。
+
+    /rewind で戻って打ち直すと JSONL は木になり、捨てた枝も同じファイルに残る。
+    時刻順に読むと言い直す前の発言まで拾うので、最後の発言から parentUuid を遡った鎖だけを生かす。
+    compact 境界（parentUuid が無い system 行）は logicalParentUuid で要約前の鎖へ繋ぐ。
+    並列 tool_use は兄弟行として書かれるので、鎖上の assistant と同じ message.id の行と
+    その tool_result も生かす。親子情報が無い古い形式は全行を生かす。
+    （scripts/jsonl_chain.py と同じ規則。日記の抽出もこれで読む）
+    """
+    by_uuid = {e["uuid"]: e for e in entries if isinstance(e, dict) and e.get("uuid")}
+    if not by_uuid:
+        return set()
+    if not any(e.get("parentUuid") for e in by_uuid.values()):
+        return set(by_uuid)
+    leaf = None
+    for e in reversed(entries):
+        if (isinstance(e, dict) and e.get("uuid") and e.get("type") in ("user", "assistant")
+                and not e.get("isSidechain")):
+            leaf = e["uuid"]
+            break
+    if leaf is None:
+        return set(by_uuid)
+    live: set = set()
+    u = leaf
+    while u and u in by_uuid and u not in live:
+        live.add(u)
+        e = by_uuid[u]
+        u = e.get("parentUuid") or e.get("logicalParentUuid")
+
+    def _mid(e: dict):
+        m = e.get("message")
+        return m.get("id") if isinstance(m, dict) else None
+
+    live_mids = {_mid(by_uuid[x]) for x in live if by_uuid[x].get("type") == "assistant"}
+    live_mids.discard(None)
+    for e in by_uuid.values():
+        if e.get("type") == "assistant" and _mid(e) in live_mids:
+            live.add(e["uuid"])
+    for e in by_uuid.values():
+        if (e.get("type") == "user" and e.get("toolUseResult") is not None
+                and e.get("parentUuid") in live):
+            live.add(e["uuid"])
+    return live
+
+
 def _prune_cli_jobs() -> None:
     now = time.time()
     expired = [k for k, j in _cli_jobs.items() if now - j.created_at > CLI_JOB_TTL and j.done]
@@ -629,6 +811,10 @@ def _save_cli_temp(job: _CliJob, name: str, data: bytes) -> Path:
 
 def _build_cli_message(req: CliRequest, job: _CliJob, *, include_context: bool = True, include_session_letter: bool = True) -> str:
     """アプリからのリクエストを1つのメッセージ文字列に組み立てる。"""
+    if _is_slash_command(req):
+        # スラッシュコマンドは飾りを一切付けない（前後の空白だけ落とす）。
+        # 添付やカメラ画像が同乗していても無視する（コマンドに添付は意味がない）
+        return req.message.strip()
     parts = []
     if req.sensor_context:
         parts.append(req.sensor_context)
@@ -640,7 +826,7 @@ def _build_cli_message(req: CliRequest, job: _CliJob, *, include_context: bool =
         # 手紙の直後に単独行の区切り線を置く。ログクリーナー(extract_thinking/rebuild_log_chunks)が
         # 「手紙だけを切除して後続のユーザーメッセージを残す」ための目印(2026-07-05)
         parts.append(f"[前のセッションからの手紙]\n{req.session_letter}")
-        # 終端マーカー(汎用記号---から誤爆しない専用の札)
+        # 終端マーカー(2026-07-05汎用記号---から誤爆しない専用の札に変更)
         parts.append("[セッションレターここまで]")
 
     file_refs = []
@@ -693,10 +879,14 @@ class _PersistentSession:
         self._current_job: _CliJob | None = None
         self._model: str | None = None
         self._effort: str | None = None
+        self._permission_prompt: bool = False
+        self._tool_timeout_sec: int = 0
         self.last_activity = time.time()
         self._context_sent = False
         self._session_letter_sent = self._letter_sent_marker.exists()
         self._last_completed_job: _CliJob | None = None
+        # 常駐プロセスの init イベントが教えてくれた「-p で使えるスラッシュコマンド」一覧
+        self.slash_commands: list[str] = []
         self._last_jsonl_mtime: float = 0.0
         # /sync がアプリ発のプロンプト（HB・センサー付きメッセージ等）を
         # 「PC側で打った言葉」と誤ってアプリに返さないための送信済みリスト
@@ -707,6 +897,64 @@ class _PersistentSession:
         # assistantテキストの台帳。/sync が同じ内容を重ねて返して二重表示になるのを防ぐ
         # （2026-07-22発覚）。dictで挿入順を保持し、古い分から間引く
         self._realtime_texts: dict[str, None] = {}
+        # 受信箱（2026-08-23）: アプリからのジョブが無い時に本人が話した分（係の結果を待ってから書いた報告、
+        # 定時の目覚め等）。以前は捨てていた＝「結果が返ってきたら報告します」のまま音沙汰なし、の正体。
+        # アプリが GET /cli/inbox で取りに来て、取られた時点で /sync の二重防止台帳に載せる
+        self._inbox: list[dict] = []
+
+    def push_inbox(self, text: str, thinking: list[str]) -> None:
+        self._inbox.append({"session_id": self.session_id, "text": text, "thinking": list(thinking), "at": time.time()})
+        if len(self._inbox) > 50:
+            del self._inbox[:-50]
+
+    def drain_inbox(self) -> list[dict]:
+        items, self._inbox = self._inbox, []
+        for it in items:
+            self.remember_realtime_text(it["text"])
+        return items
+
+    def _on_result(self, job: "_CliJob", event: dict) -> bool:
+        """result イベントの処理。戻り値 True=係待ちでジョブを開けたまま、False=閉じた。"""
+        if not job.session_id and event.get("session_id"):
+            job.session_id = event["session_id"]
+        if job._agents_launched_this_turn > 0:
+            # 係の結果を待ってからの続きがある＝返事はまだ終わっていない。ジョブは開けたまま、
+            # ここまでの本文は途中経過として先に配る（「結果が返ってきたら報告しますね」がすぐ届く）。
+            # 係が戻って本人が続きを書き、次の result が来た時に閉じる。戻らない事故は
+            # CLI_AGENT_WAIT_MAX で /cli/stream 側が打ち切る（2026-08-23・8/18 の真因）
+            for t in job.undelivered_texts():
+                job._pending_intermediates.append(t)
+            job._last_intermediate_text_idx = len(job._assistant_texts) - 1
+            job._waiting_for_agents_since = time.time()
+            launched = job._agents_launched_this_turn
+            job._agents_launched_this_turn = 0
+            print(f"CLI WAIT [{job.job_id}]: {launched} agent(s) running, keeping job open", flush=True)
+            return True
+        self._finish_job(job, raw_result=event.get("result", ""))
+        return False
+
+    def _finish_job(self, job: "_CliJob", raw_result: str = "", note: str = "") -> None:
+        """ジョブを完了にする（result 到着時、または係待ちの打ち切り時）。"""
+        if job.done:
+            return
+        if job._assistant_texts:
+            job.result_text = "\n\n".join(job._assistant_texts)
+        else:
+            if "previous response had no visible output" in raw_result:
+                raw_result = raw_result.replace("[Your previous response had no visible output. Please continue and produce a user-visible response.]", "").strip()
+            job.result_text = raw_result
+        if job._included_context:
+            self._context_sent = True
+        if job._included_session_letter:
+            self._session_letter_sent = True
+            self._persist_letter_sent()
+        job._waiting_for_agents_since = None
+        job.done = True
+        job.cleanup_temp()
+        self._last_completed_job = job
+        self.last_activity = time.time()
+        self._snapshot_jsonl_mtime()
+        print(f"CLI DONE [{job.job_id}]: events={len(job.events)}, texts={len(job._assistant_texts)}{note}", flush=True)
 
     def remember_realtime_text(self, text: str) -> None:
         self._realtime_texts[text] = None
@@ -742,14 +990,18 @@ class _PersistentSession:
             except OSError:
                 pass
 
-    async def ensure_started(self, model: str | None, effort: str | None) -> None:
-        """プロセスが動いていなければ起動。model/effort 変更時は再起動。
+    async def ensure_started(self, model: str | None, effort: str | None, permission_prompt: bool = False,
+                            tool_timeout_sec: int = 0) -> None:
+        """プロセスが動いていなければ起動。model/effort/permission_prompt/tool_timeout_sec 変更時は再起動。
         他プロセス（PC Claude Code等）がJONLに書き込んでいた場合も再起動する。"""
+        tool_timeout_sec = _normalize_tool_timeout(tool_timeout_sec)
         needs_restart = (
             self.process is None
             or self.process.returncode is not None
             or self._model != model
             or self._effort != effort
+            or self._permission_prompt != permission_prompt
+            or self._tool_timeout_sec != tool_timeout_sec
         )
         if not needs_restart:
             jsonl_path = _find_session_jsonl(self.session_id)
@@ -802,6 +1054,15 @@ class _PersistentSession:
             if not unchanged:
                 mcp_config_file.write_text(mcp_config_content, encoding="utf-8")
             cmd.extend(["--mcp-config", str(mcp_config_file)])
+            if permission_prompt:
+                # 承認が要るツール実行を mcp_tools.py の request_permission に委譲する。
+                # 応答が無ければ deny（従来の自動denyと同じ結果）に落ちる設計なので、
+                # 付けても付けなくても「通っていたものが通らなくなる」方向の変化はない。
+                # --permission-mode default を明示するのは、settings.json 側の Auto mode（分類器）が
+                # 承認ツールと並走して先に allow を出し、スマホのカードが「押す前に消える」のを防ぐため
+                # （2026-08-16 実機で観測）。承認をスマホで受けると決めた以上、判定は一本にする
+                cmd.extend(["--permission-prompt-tool", PERMISSION_TOOL_NAME,
+                            "--permission-mode", "default"])
         if model:
             cmd.extend(["--model", model])
         if effort:
@@ -809,14 +1070,17 @@ class _PersistentSession:
 
         self._model = model
         self._effort = effort
+        self._permission_prompt = permission_prompt
+        self._tool_timeout_sec = tool_timeout_sec
         self._context_sent = session_exists
         self._session_letter_sent = session_exists or self._letter_sent_marker.exists()
 
         mode = "resume" if session_exists else "new"
-        print(f"SESSION START [{self.session_id[:8]}]: mode={mode}, model={model}, effort={effort}", flush=True)
+        print(f"SESSION START [{self.session_id[:8]}]: mode={mode}, model={model}, effort={effort}, permission_prompt={permission_prompt}, tool_timeout_sec={tool_timeout_sec}", flush=True)
 
         self.process = await asyncio.create_subprocess_exec(
             *cmd,
+            env=_claude_env(tool_timeout_sec),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -882,16 +1146,47 @@ class _PersistentSession:
             esubtype = event.get("subtype", "")
             event_count += 1
 
+            if etype == "system" and esubtype == "init":
+                # 起動時に一度だけ来る。-p で使えるスラッシュコマンド一覧を控えておく（/cli/slash_commands で返す）
+                sc = event.get("slash_commands")
+                if isinstance(sc, list):
+                    self.slash_commands = [str(x) for x in sc]
+                    print(f"CLI INIT: slash_commands={len(self.slash_commands)}", flush=True)
+
             job = self._current_job
             if job is None or job.done:
+                # ジョブが無い時の本人の発言は受信箱へ（2026-08-23）。係の結果を待ってからの報告が典型。
+                # 係由来(parent_tool_use_id)は本人ではないので受信箱にも入れない
+                if etype == "assistant" and not _is_subagent_event(event):
+                    texts, thinks = _split_assistant_event(event)
+                    if texts:
+                        self.push_inbox("\n\n".join(texts), thinks)
+                        print(f"CLI INBOX [{self.session_id[:8]}]: {len(texts)} text(s) queued (no active job)", flush=True)
+                continue
+
+            # サブエージェント由来のイベントは取り込まない（2026-08-23）。
+            # Claude Code が Agent ツールで係を起こすと、係の assistant/user イベントも同じ stream-json に
+            # parent_tool_use_id 付きで流れてくる。これを本人の発言として拾うと、係の途中報告がアプリに
+            # 届いたり、本人の返事が「配達済み」扱いで落ちたりする（8/18 の「-pでサブエージェントを使うと
+            # 返事が届かない」）。本人の発言は parent_tool_use_id が null
+            if _is_subagent_event(event):
+                job._subagent_events_dropped += 1
                 continue
 
             job.add_event(event)
+
+            if etype == "user" and _event_launches_async_agent(event, job._agent_tool_use_ids):
+                # Agent ツールの tool_result「Async agent launched successfully」＝係を起こした印
+                # （本人が呼んだ Agent ツールの id に限る。2026-08-28）
+                job._agents_launched_this_turn += 1
 
             if etype == "assistant":
                 msg = event.get("message", {})
                 content = msg.get("content", [])
                 if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Agent" and b.get("id"):
+                            job._agent_tool_use_ids.add(b["id"])
                     has_tool_use = any(b.get("type") == "tool_use" for b in content if isinstance(b, dict))
                     if has_tool_use and job._assistant_texts:
                         current_idx = len(job._assistant_texts) - 1
@@ -914,26 +1209,12 @@ class _PersistentSession:
                                     job._thinking_texts.append(t)
 
             if etype == "result":
-                if job._assistant_texts:
-                    job.result_text = "\n\n".join(job._assistant_texts)
-                else:
-                    raw_result = event.get("result", "")
-                    if "previous response had no visible output" in raw_result:
-                        raw_result = raw_result.replace("[Your previous response had no visible output. Please continue and produce a user-visible response.]", "").strip()
-                    job.result_text = raw_result
-                if not job.session_id and event.get("session_id"):
-                    job.session_id = event["session_id"]
-                if job._included_context:
-                    self._context_sent = True
-                if job._included_session_letter:
-                    self._session_letter_sent = True
-                    self._persist_letter_sent()
-                job.done = True
-                job.cleanup_temp()
-                self._last_completed_job = job
-                self.last_activity = time.time()
-                self._snapshot_jsonl_mtime()
-                print(f"CLI DONE [{job.job_id}]: events={len(job.events)}, texts={len(job._assistant_texts)}", flush=True)
+                try:
+                    self._on_result(job, event)
+                except Exception as e:  # 読み取りループを死なせない（8/23 13:24 の停止の教訓）
+                    print(f"CLI RESULT ERROR [{job.job_id}]: {e!r}", flush=True)
+                    job.error = f"server error on result: {e!r}"
+                    job.done = True
 
         if proc.returncode is None:
             try:
@@ -1057,10 +1338,14 @@ async def cli_start(req: CliRequest):
         return recovered_resp
 
     try:
-        await session.ensure_started(req.model, req.effort)
-        include_context = not session._context_sent
-        include_session_letter = not session._session_letter_sent
+        await session.ensure_started(req.model, req.effort, req.permission_prompt, req.tool_timeout_sec)
+        is_slash = _is_slash_command(req)
+        # スラッシュコマンドの回は「大切なこと」「手紙」を載せない（載せたことにもしない。次の普通の発言で載る）
+        include_context = not session._context_sent and not is_slash
+        include_session_letter = not session._session_letter_sent and not is_slash
         message = _build_cli_message(req, job, include_context=include_context, include_session_letter=include_session_letter)
+        if is_slash:
+            print(f"CLI SLASH [{job_id}]: {message[:60]!r}", flush=True)
         if include_context:
             job._included_context = True
         if include_session_letter and req.session_letter:
@@ -1082,6 +1367,13 @@ async def cli_start(req: CliRequest):
     return {"job_id": job_id, "session_id": req.session_id}
 
 
+@app.get("/cli/slash_commands/{session_id}", dependencies=[Depends(require_token)])
+async def cli_slash_commands(session_id: str):
+    """そのセッションの常駐プロセスが受け付けるスラッシュコマンド一覧（未起動なら空）。"""
+    session = _persistent_sessions.get(session_id)
+    return {"slash_commands": session.slash_commands if session else []}
+
+
 @app.get("/cli/stream/{job_id}", dependencies=[Depends(require_token)])
 async def cli_stream(job_id: str, after: int = -1):
     """ポーリング用。指定インデックス以降のイベントを返す。"""
@@ -1089,12 +1381,27 @@ async def cli_stream(job_id: str, after: int = -1):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # 係待ちの打ち切り（2026-08-23）: 係が戻らない・本人が続きを書かないまま上限を過ぎたら、ここまでの本文で閉じる
+    if not job.done and job._waiting_for_agents_since is not None \
+            and time.time() - job._waiting_for_agents_since > CLI_AGENT_WAIT_MAX:
+        for session in list(_persistent_sessions.values()):
+            if session._current_job is job:
+                session._finish_job(job, note=" (agent wait timeout)")
+                break
+        else:
+            job._waiting_for_agents_since = None
+            job.done = True
+
     events = [e for e in job.events if e.get("index", 0) > after]
 
     response: dict = {"events": events, "done": job.done}
     if job._pending_intermediates:
         response["intermediate_messages"] = job._pending_intermediates
         job._pending_intermediates = []
+    pending_perms = _list_pending_permissions()
+    if pending_perms:
+        # 承認待ちがあればポーリング応答に同乗させる（アプリは未知キーを無視するので旧アプリにも無害）
+        response["pending_permissions"] = pending_perms
     if job.done:
         response["session_id"] = job.session_id
         if job.supports_undelivered_only:
@@ -1121,6 +1428,102 @@ async def cli_stream(job_id: str, after: int = -1):
         job.result_delivered = True
         job.events = []
     return response
+
+
+# =============================================================================
+# 画像下り管 / スマホ承認（mcp_tools.py の show_image / request_permission と対）
+# =============================================================================
+
+_IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
+@app.get("/cli/image/{image_id}", dependencies=[Depends(require_token)])
+async def cli_image(image_id: str):
+    """show_image が bridge/images/ に置いた画像を返す。id は mcp_tools.image_id_for(path) と同じ計算。"""
+    if not _IMAGE_ID_RE.fullmatch(image_id):
+        raise HTTPException(status_code=400, detail="image_id の形式が不正です")
+    for ext, media_type in _IMAGE_MEDIA_TYPES.items():
+        candidate = IMAGES_DIR / f"{image_id}{ext}"
+        if candidate.is_file():
+            return FileResponse(str(candidate), media_type=media_type)
+    raise HTTPException(status_code=404, detail="Image not found")
+
+
+def _list_pending_permissions() -> list[dict]:
+    """応答待ちの承認要求（request.json があって response.json がないもの）を古い順に返す。"""
+    items: list[dict] = []
+    try:
+        for req_path in PERMISSIONS_DIR.glob("*.request.json"):
+            perm_id = req_path.name[: -len(".request.json")]
+            if not _PERM_ID_RE.fullmatch(perm_id):
+                continue
+            if (PERMISSIONS_DIR / f"{perm_id}.response.json").exists():
+                continue
+            try:
+                data = json.loads(req_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            items.append({
+                "id": perm_id,
+                "tool_name": str(data.get("tool_name", "")),
+                "input": data.get("input", {}),
+                "created_at": data.get("created_at", 0),
+            })
+    except OSError:
+        pass
+    items.sort(key=lambda d: d.get("created_at", 0))
+    return items
+
+
+class PermissionResponse(BaseModel):
+    behavior: str  # "allow" | "deny"
+    message: str | None = None
+
+
+@app.get("/cli/permissions", dependencies=[Depends(require_token)])
+async def cli_permissions():
+    """承認待ち一覧（ポーリング外から確認したい時用。通常は /cli/stream に同乗）。"""
+    return {"pending_permissions": _list_pending_permissions()}
+
+
+@app.get("/cli/inbox", dependencies=[Depends(require_token)])
+async def cli_inbox():
+    """受信箱（2026-08-23）。ジョブが無い時に本人が話した分を全セッション分まとめて返し、空にする。
+    アプリはチャット画面表示中・CLIモードの間だけ数秒おきに取りに来る。取られた分は /sync の二重防止台帳に載る"""
+    messages: list[dict] = []
+    for session in list(_persistent_sessions.values()):
+        messages.extend(session.drain_inbox())
+    return {"messages": messages}
+
+
+@app.post("/cli/permission/{perm_id}", dependencies=[Depends(require_token)])
+async def cli_permission_respond(perm_id: str, body: PermissionResponse):
+    """アプリからの承認応答を response.json に書く。mcp_tools.request_permission がそれを拾って claude に返す。"""
+    if not _PERM_ID_RE.fullmatch(perm_id):
+        raise HTTPException(status_code=400, detail="id の形式が不正です")
+    if body.behavior not in ("allow", "deny"):
+        raise HTTPException(status_code=400, detail="behavior は allow か deny")
+    request_path = PERMISSIONS_DIR / f"{perm_id}.request.json"
+    if not request_path.exists():
+        # もう claude 側でタイムアウト済み等。アプリには「期限切れ」で返す
+        raise HTTPException(status_code=404, detail="この承認要求は既に終了しています")
+    payload = {"behavior": body.behavior}
+    if body.behavior == "deny":
+        payload["message"] = body.message or "ユーザーがスマホで拒否しました"
+    response_path = PERMISSIONS_DIR / f"{perm_id}.response.json"
+    tmp = PERMISSIONS_DIR / f"{perm_id}.response.json.tmp"
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(response_path)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"応答を書けません: {e}")
+    print(f"PERMISSION [{perm_id[:12]}]: {body.behavior}", flush=True)
+    return {"ok": True, "id": perm_id, "behavior": body.behavior}
 
 
 # =============================================================================
@@ -1220,6 +1623,7 @@ async def sync_session(session_id: str, after: str = ""):
     messages = []
     pending_thinking = ""
     try:
+        entries = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -1229,48 +1633,58 @@ async def sync_session(session_id: str, after: str = ""):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                entry_type = entry.get("type", "")
-                if entry_type not in ("user", "assistant"):
-                    continue
-                if entry.get("isMeta"):
-                    continue
-                ts = entry.get("timestamp", "")
-                if after and ts <= after:
-                    continue
-                extractor = _extract_text_with_thinking if entry_type == "assistant" else _extract_text
-                text = extractor(entry.get("message", ""))
-                if not text:
-                    continue
-                if text.strip() in harness_meta_texts:
-                    continue
-                if text.lstrip().startswith("<task-notification"):
-                    continue
-                if entry_type == "user" and _is_app_origin_user_text(session_id, text):
+                if isinstance(entry, dict):
+                    entries.append(entry)
+        # /rewind で捨てた枝は返さない（2026-08-23）
+        live = _live_uuids(entries)
+        for entry in entries:
+            entry_type = entry.get("type", "")
+            if entry_type not in ("user", "assistant"):
+                continue
+            if entry.get("uuid") and entry["uuid"] not in live:
+                continue
+            if entry.get("isMeta"):
+                continue
+            if _is_sidechain_entry(entry):
+                # サブエージェントの会話（isSidechain）は本人の会話ではない（2026-08-23）
+                continue
+            ts = entry.get("timestamp", "")
+            if after and ts <= after:
+                continue
+            extractor = _extract_text_with_thinking if entry_type == "assistant" else _extract_text
+            text = extractor(entry.get("message", ""))
+            if not text:
+                continue
+            if text.strip() in harness_meta_texts:
+                continue
+            if text.lstrip().startswith("<task-notification"):
+                continue
+            if entry_type == "user" and _is_app_origin_user_text(session_id, text):
+                pending_thinking = ""
+                continue
+            if entry_type == "assistant" and active is not None:
+                # リアルタイム経路（intermediate/result/recovered）が配達する(した)応答は
+                # /sync からは返さない（二重表示防止 2026-07-22発覚）。thinkingを除いた
+                # 本文で照合する（台帳はtextブロック単位のため）
+                plain = _extract_text(entry.get("message", ""))
+                if plain and plain in active._realtime_texts:
                     pending_thinking = ""
                     continue
-                if entry_type == "assistant" and active is not None:
-                    # リアルタイム経路（intermediate/result/recovered）が配達する(した)応答は
-                    # /sync からは返さない（二重表示防止 2026-07-22発覚）。thinkingを除いた
-                    # 本文で照合する（台帳はtextブロック単位のため）
-                    plain = _extract_text(entry.get("message", ""))
-                    if plain and plain in active._realtime_texts:
-                        pending_thinking = ""
-                        continue
-                if entry_type == "assistant":
-                    stripped = text.strip()
-                    if stripped.startswith("<thinking>") and stripped.endswith("</thinking>"):
-                        pending_thinking = text
-                        continue
-                    if pending_thinking:
-                        text = pending_thinking + text
-                        pending_thinking = ""
-                if entry_type != "assistant":
+            if entry_type == "assistant":
+                stripped = text.strip()
+                if stripped.startswith("<thinking>") and stripped.endswith("</thinking>"):
+                    pending_thinking = text
+                    continue
+                if pending_thinking:
+                    text = pending_thinking + text
                     pending_thinking = ""
-                messages.append({
-                    "role": entry_type,
-                    "content": text,
-                    "timestamp": ts,
-                })
+            if entry_type != "assistant":
+                pending_thinking = ""
+            messages.append({
+                "role": entry_type,
+                "content": text,
+                "timestamp": ts,
+            })
         if pending_thinking:
             messages.append({
                 "role": "assistant",

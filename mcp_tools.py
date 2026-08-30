@@ -11,8 +11,13 @@ server.py が --mcp-config でこのサーバーを自動登録するため、
 ユーザーによる手動設定は不要。
 """
 
+import asyncio
+import hashlib
 import json
 import os
+import shutil
+import time
+import uuid
 from pathlib import Path
 
 from mcp.server import Server
@@ -21,6 +26,23 @@ from mcp.types import TextContent, Tool
 
 BRIDGE_DIR = Path(os.environ.get("COMPANION_BRIDGE_DIR", ""))
 HEALTH_DATA_PATH = BRIDGE_DIR / "health_data.json" if BRIDGE_DIR.name else None
+
+# show_image: Mac側の画像を bridge/images/ にコピーし、アプリが GET /cli/image/{id} で取りに来る。
+# id は「呼び出し時の path 文字列」の sha256 先頭32桁。アプリ側も同じ計算で id を出す（server.py側の注入不要）
+IMAGES_DIR = BRIDGE_DIR / "images" if BRIDGE_DIR.name else None
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+IMAGE_MAX_BYTES = 12 * 1024 * 1024
+
+# request_permission: Claude Code の --permission-prompt-tool から呼ばれる。
+# bridge/permissions/{id}.request.json を書き、server.py 経由でアプリが {id}.response.json を書くまで待つ。
+# 応答が来なければ deny（= 従来の -p モードの自動denyと同じ結果に落ちる）
+PERMISSIONS_DIR = BRIDGE_DIR / "permissions" if BRIDGE_DIR.name else None
+PERMISSION_TIMEOUT_SECONDS = float(os.environ.get("COMPANION_PERMISSION_TIMEOUT", "300"))
+PERMISSION_POLL_SECONDS = 0.5
+
+
+def image_id_for(path_str: str) -> str:
+    return hashlib.sha256(path_str.encode("utf-8")).hexdigest()[:32]
 
 
 server = Server("companion")
@@ -170,6 +192,37 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="show_image",
+            description="このMac上の画像ファイルをユーザーのスマホ画面に表示する（チャットに画像バブルとして届く）。描いた絵や撮ったスナップショットを見せたい時に使う。対応: jpg/png/gif/webp、12MBまで。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "画像ファイルの絶対パス",
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "画像に添える一言（任意）",
+                    },
+                },
+                "required": ["path"],
+            },
+        ),
+        Tool(
+            name="request_permission",
+            description="（内部用）Claude Codeのツール実行承認をユーザーのスマホに問い合わせる。--permission-prompt-tool から自動で呼ばれる。会話の中で直接呼ばないこと。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string"},
+                    "input": {"type": "object"},
+                    "tool_use_id": {"type": "string"},
+                },
+                "required": ["tool_name", "input"],
+            },
+        ),
+        Tool(
             name="get_sleep_events",
             description="睡眠データを取得する。ユーザーの就寝・起床イベントや睡眠の深さ（浅い睡眠/深い睡眠/REM）を確認して、睡眠の状態を把握する。日記に書く時や、おはようの声かけに使う。",
             inputSchema={
@@ -218,6 +271,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # 実際のカード挿入はアプリがtool_useイベントから行う。htmlは大きいのでエコーしない
         return _ok(action="show_html", title=arguments.get("title", ""))
 
+    if name == "show_image":
+        return _show_image(arguments.get("path", ""), arguments.get("caption", ""))
+
+    if name == "request_permission":
+        return await _request_permission(arguments)
+
     if name == "get_sleep_events":
         if HEALTH_DATA_PATH and HEALTH_DATA_PATH.exists():
             try:
@@ -229,6 +288,107 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text='{"summary": "睡眠データはまだ受信していません"}')]
 
     return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}, ensure_ascii=False))]
+
+
+def _error(message: str) -> list[TextContent]:
+    return [TextContent(type="text", text=json.dumps({"status": "error", "message": message}, ensure_ascii=False))]
+
+
+def _show_image(path_str: str, caption: str) -> list[TextContent]:
+    """画像を bridge/images/{id}{ext} にコピーする。表示自体はアプリが tool_use イベントを見て
+    GET /cli/image/{id} で取りに来る。失敗は error を返し、アプリ側は取得404で黙って諦める。"""
+    if IMAGES_DIR is None:
+        return _error("COMPANION_BRIDGE_DIR が未設定です")
+    if not path_str:
+        return _error("path が空です")
+    src = Path(os.path.expanduser(path_str))
+    if not src.is_file():
+        return _error(f"ファイルが見つかりません: {path_str}")
+    ext = src.suffix.lower()
+    if ext not in IMAGE_EXTS:
+        return _error(f"対応していない画像形式です: {ext or '(拡張子なし)'}")
+    try:
+        size = src.stat().st_size
+    except OSError as e:
+        return _error(f"ファイルにアクセスできません: {e}")
+    if size > IMAGE_MAX_BYTES:
+        return _error(f"画像が大きすぎます（{size // 1024 // 1024}MB > 12MB）")
+    image_id = image_id_for(path_str)
+    try:
+        IMAGES_DIR.mkdir(exist_ok=True)
+        # 同じ id の古い拡張子違いが残らないよう掃除してからコピー
+        for old in IMAGES_DIR.glob(f"{image_id}.*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        shutil.copyfile(src, IMAGES_DIR / f"{image_id}{ext}")
+    except OSError as e:
+        return _error(f"コピーに失敗しました: {e}")
+    return _ok(action="show_image", image_id=image_id, caption=caption, bytes=size)
+
+
+async def _request_permission(arguments: dict) -> list[TextContent]:
+    """承認要求を書き、アプリの応答（server.py が書く response.json）を待つ。
+    戻り値は Claude Code が要求する {behavior: allow|deny} の JSON 文字列。"""
+    tool_name = str(arguments.get("tool_name", ""))
+    tool_input = arguments.get("input", {})
+    raw_id = str(arguments.get("tool_use_id") or uuid.uuid4().hex)
+    # ファイル名に使うので英数とハイフン・アンダースコアだけに丸める
+    perm_id = "".join(ch for ch in raw_id if ch.isalnum() or ch in "-_")[:80] or uuid.uuid4().hex
+
+    def deny(message: str) -> list[TextContent]:
+        return [TextContent(type="text", text=json.dumps({"behavior": "deny", "message": message}, ensure_ascii=False))]
+
+    if PERMISSIONS_DIR is None:
+        return deny("COMPANION_BRIDGE_DIR が未設定のため承認できません")
+    try:
+        PERMISSIONS_DIR.mkdir(exist_ok=True)
+    except OSError as e:
+        return deny(f"承認ディレクトリを作れません: {e}")
+
+    request_path = PERMISSIONS_DIR / f"{perm_id}.request.json"
+    response_path = PERMISSIONS_DIR / f"{perm_id}.response.json"
+    payload = {
+        "id": perm_id,
+        "tool_name": tool_name,
+        "input": tool_input,
+        "created_at": time.time(),
+    }
+    try:
+        # 書きかけをserver.pyが読まないよう、一時名で書いてからrename
+        tmp = PERMISSIONS_DIR / f"{perm_id}.request.json.tmp"
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(request_path)
+    except OSError as e:
+        return deny(f"承認要求を書けません: {e}")
+
+    deadline = time.monotonic() + PERMISSION_TIMEOUT_SECONDS
+    result: dict | None = None
+    try:
+        while time.monotonic() < deadline:
+            if response_path.exists():
+                try:
+                    result = json.loads(response_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    result = None
+                if isinstance(result, dict) and result.get("behavior") in ("allow", "deny"):
+                    break
+                result = None
+            await asyncio.sleep(PERMISSION_POLL_SECONDS)
+    finally:
+        for p in (request_path, response_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    if result is None:
+        return deny("スマホからの応答がありませんでした（タイムアウト）")
+    if result["behavior"] == "allow":
+        # 正式な形は updatedInput 付き（Claude Code の permission-prompt-tool 仕様。無い版だと承認しても検証で蹴られる・Codex 8/29）
+        return [TextContent(type="text", text=json.dumps({"behavior": "allow", "updatedInput": tool_input}, ensure_ascii=False))]
+    return deny(str(result.get("message") or "ユーザーがスマホで拒否しました"))
 
 
 async def main():
